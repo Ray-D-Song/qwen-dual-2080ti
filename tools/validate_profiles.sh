@@ -65,6 +65,7 @@ expected_profiles=(
   2x2080Ti/qwen27b/w8a16/yarn-fp8kv-1x338K-text-only.env
   2x2080Ti/qwen27b/w4a16/dflash2-fp8kv-1x262K-text-image.env
   2x2080Ti/qwen27b/w4a16/yarn-fp8kv-1x524K-text-only.env
+  2x2080Ti/qwen27b/w4a16/swift-mtp4-fp8kv-1x262K-text-image.env
   2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-2x229K-text-only.env
   2x2080Ti/qwen27b/w4a16/dflash-fp8kv-2x176K-text-only.env
   2x2080Ti/qwen27b/w4a16/mtp4-tq4nc-3x262K-text-only.env

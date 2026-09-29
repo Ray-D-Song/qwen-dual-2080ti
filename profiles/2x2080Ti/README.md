@@ -25,6 +25,14 @@ Tested weight: [unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.
 | `qwen27b/w4a16/dflash-fp8kv-2x176K-text-only.env` | 2 x 176K | FP8 | DFlash/7 | text-only | 357,194 | 1412.94 / 223.08 | 1249.27 / 211.10 |
 | `qwen27b/w4a16/mtp4-tq4nc-3x262K-text-only.env` | 3 x 262K | TQ4NC | MTP/4 | text-only | 837,832 | 1446.95 / 127.86 | 1265.68 / 68.64 |
 
+## Swift-1.5-Qwen3.8-27B-W4A16
+
+Weight: [ukisai/Swift-1.5-Qwen3.8-27b-W4A16-AWQ](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27b-W4A16-AWQ). `compressed-tensors` W4A16; the vision tower and MTP stay BF16. Official runtime and benchmark validation are still pending, so the performance columns below are unmeasured.
+
+| Profile | Context | KV | Speculative decoding | Messages | GPU KV tokens | 4K/128 prefill / decode | 32K/512 prefill / decode |
+|---|---:|---|---|---|---:|---:|---:|
+| `qwen27b/w4a16/swift-mtp4-fp8kv-1x262K-text-image.env` | 262K | FP8 | MTP/4 | text+image | unmeasured | unmeasured | unmeasured |
+
 ## Qwen3.6-35B-A3B-FP8
 
 Tested weight: [Qwen/Qwen3.6-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)
