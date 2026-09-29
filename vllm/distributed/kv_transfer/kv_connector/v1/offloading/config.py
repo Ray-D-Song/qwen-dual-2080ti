@@ -33,9 +33,32 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec
 
 
+def _is_pure_draft_offload_skip(group: "KVCacheGroupSpec") -> bool:
+    """Skip only standalone MTP/EAGLE draft groups, not packed target attention.
+
+    Qwen3.5-style MTP often marks the target full-attention group as eagle
+    because the predictor is merged into it. Skipping that group from offload
+    while still serving GDN/Mamba hits leaves attention KV unwritten and the
+    model emits garbled or looping tokens. Standalone ``mtp.layers.*`` groups
+    still skip offload — their page geometry can fail ``group_kernel_blocks``.
+    """
+    if not group.is_eagle_group:
+        return False
+    names = group.layer_names
+    if not names:
+        return True
+    return all(
+        name.startswith("mtp.layers.") or ".mtp.layers." in name for name in names
+    )
+
+
 def get_offloading_group_ids(kv_cache_config: "KVCacheConfig") -> tuple[int, ...]:
     if kv_cache_config.hisparse_host_num_blocks is None:
-        return tuple(range(len(kv_cache_config.kv_cache_groups)))
+        return tuple(
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if not _is_pure_draft_offload_skip(group)
+        )
     return tuple(
         group_id
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)

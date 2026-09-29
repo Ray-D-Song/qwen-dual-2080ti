@@ -1482,6 +1482,51 @@ class MambaManager(SingleTypeKVCacheManager):
             # connector; a request that finishes first hands off this table
             # source directly.
             self._producer_partial_tail_reqs: dict[str, tuple[KVCacheBlock, int]] = {}
+            # Requests whose last state block was filled by an external
+            # (connector) load and has not yet been consumed by a forward,
+            # mapped to their computed-token count at load time. An async load
+            # allocates in one step and runs in a later one; the state block
+            # must survive that later step's remove_skipped_blocks, since the
+            # worker only copies it out during that step's forward.
+            self._unconsumed_external_state: dict[str, int] = {}
+
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        """Lay out an align-mode external hit like a local one.
+
+        Only the state at the hit boundary is needed, so interior slots are
+        null and a single block at the boundary receives the loaded state.
+        """
+        if self.mamba_cache_mode != "align":
+            super().allocate_external_computed_blocks(
+                request_id,
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+            return
+
+        num_total_computed_tokens = (
+            num_local_computed_tokens + num_external_computed_tokens
+        )
+        if num_total_computed_tokens <= 0:
+            return
+        req_blocks = self.req_to_blocks[request_id]
+        num_required = cdiv(num_total_computed_tokens, self.block_size)
+        if num_required <= len(req_blocks):
+            return
+        nulls_needed = num_required - 1 - len(req_blocks)
+        if nulls_needed > 0:
+            req_blocks.extend([self._null_block] * nulls_needed)
+        if len(req_blocks) < num_required:
+            new_blocks = self.block_pool.get_new_blocks(num_required - len(req_blocks))
+            req_blocks.extend(new_blocks)
+            if self._record_new_block_ids:
+                self.new_block_ids.extend(b.block_id for b in new_blocks)
+        self._unconsumed_external_state[request_id] = num_total_computed_tokens
 
     @classmethod
     def find_longest_cache_hit(
@@ -1501,6 +1546,10 @@ class MambaManager(SingleTypeKVCacheManager):
         )
         assert dcp_world_size == 1, "DCP not support mamba now."
         assert pcp_world_size == 1, "PCP not support mamba now."
+        if drop_eagle_block:
+            # Mamba state may include draft positions rejected during MTP verification.
+            # Exclude the final Mamba block from cross-request prefix hits.
+            max_length = max(0, max_length - kv_cache_spec.block_size)
         block_hashes = resolve_block_hashes(
             block_hashes,
             block_pool.hash_block_size,
@@ -1664,7 +1713,8 @@ class MambaManager(SingleTypeKVCacheManager):
             # `last_state_block_idx` to free the appropriate block and replace it
             # with a null block.
             if (
-                last_state_block_idx is not None
+                request_id not in self._unconsumed_external_state
+                and last_state_block_idx is not None
                 and last_state_block_idx
                 <= cdiv(processed_computed_tokens, self.block_size) - 1
             ):
@@ -1829,6 +1879,11 @@ class MambaManager(SingleTypeKVCacheManager):
             # We can ignore lookahead tokens because current draft models don't have
             # mamba layers.
             num_tokens = num_tokens_main_model
+            loaded_tokens = self._unconsumed_external_state.get(request_id)
+            if loaded_tokens is not None and num_tokens > loaded_tokens:
+                # This allocation schedules the first forward that reads the
+                # loaded state; normal retirement resumes on the next step.
+                del self._unconsumed_external_state[request_id]
             req_blocks: list[KVCacheBlock] = self.req_to_blocks[request_id]
             # NOTE(tdouble): this is an over-estimate of how many blocks we need because
             # num_tokens can include draft tokens that will later be rejected.
@@ -1970,6 +2025,7 @@ class MambaManager(SingleTypeKVCacheManager):
             self._num_retired_blocks.pop(request_id, None)
             self._checkpoints.pop(request_id, None)
             self._producer_partial_tail_reqs.pop(request_id, None)
+            self._unconsumed_external_state.pop(request_id, None)
             # An offer is only guaranteed to hold committed bytes until the end
             # of the pass that made it. This request's blocks are going back to
             # the pool now, so drop its not-yet-offered hand-offs rather than

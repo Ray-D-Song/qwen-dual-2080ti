@@ -4720,6 +4720,8 @@ build_args() {
   [[ "${ENABLE_AUTO_TOOL_CHOICE:-0}" == "1" ]] && VLLM_ARGS+=(--enable-auto-tool-choice)
   [[ -n "${ADDITIONAL_CONFIG_JSON:-}" ]] && VLLM_ARGS+=(--additional-config "$ADDITIONAL_CONFIG_JSON")
   [[ -n "${HF_OVERRIDES_JSON:-}" ]] && VLLM_ARGS+=(--hf-overrides "$HF_OVERRIDES_JSON")
+  # 追加（本地补丁）：KV cache offload 参数由环境变量注入，未设置时行为不变
+  [[ -n "${KV_TRANSFER_CONFIG:-}" ]] && VLLM_ARGS+=(--kv-transfer-config "$KV_TRANSFER_CONFIG")
 
   if [[ -n "${MM_LIMIT_JSON:-}" ]]; then
     VLLM_ARGS+=(--limit-mm-per-prompt "$MM_LIMIT_JSON")

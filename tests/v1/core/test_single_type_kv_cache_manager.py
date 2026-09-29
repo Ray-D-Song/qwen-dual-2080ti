@@ -259,6 +259,48 @@ def test_mamba_align_retires_replaced_state_at_block_boundary():
     assert pool.get_num_free_blocks() == 0
 
 
+def test_mamba_align_async_external_state_survives_resume_step():
+    """An async-loaded state block must still be in the table when its first
+    forward runs; that forward reads the state from it."""
+    block_size = 4
+    num_speculative_blocks = 4
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=num_speculative_blocks,
+    )
+    pool = BlockPool(num_gpu_blocks=32, enable_caching=True, hash_block_size=4)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    loaded = 4 * block_size
+
+    # Load step: connector hit, no compute scheduled.
+    manager.remove_skipped_blocks("r", 0)
+    manager.allocate_external_computed_blocks("r", 0, loaded)
+    manager.allocate_new_blocks("r", loaded, loaded)
+    state_block = manager.req_to_blocks["r"][3]
+    assert not state_block.is_null
+    assert all(b.is_null for b in manager.req_to_blocks["r"][:3])
+
+    # Resume step after the load finished: first forward over the hit.
+    manager.remove_skipped_blocks("r", loaded)
+    manager.allocate_new_blocks("r", loaded + block_size, loaded + block_size)
+    assert manager.req_to_blocks["r"][3] is state_block
+    assert manager.last_state_block_idx["r"] == 3
+
+    # The step after that retires the consumed state as usual.
+    manager.remove_skipped_blocks("r", loaded + block_size)
+    assert manager.req_to_blocks["r"][3].is_null
+    assert state_block.ref_cnt == 0
+
+
 def get_sliding_window_manager(
     sliding_window_spec,
     block_pool,
