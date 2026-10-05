@@ -1,0 +1,16 @@
+[Unit]
+Description=vLLM Swift health watchdog
+Documentation=file:///usr/local/share/doc/vllm-swift-healthcheck/README.md
+# Ordered after the service so an OnBootSec trigger cannot race the first start,
+# but not Requires=: the watchdog must still run when the unit has failed.
+After=vllm-swift.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/vllm-swift-healthcheck.sh
+# The watchdog may restart a large model server; keep it out of the way.
+Nice=10
+IOSchedulingClass=idle
+# A health probe plus systemctl calls; generous but bounded.
+TimeoutStartSec=180

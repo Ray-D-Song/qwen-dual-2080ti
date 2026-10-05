@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic vLLM Swift health watchdog
+Documentation=file:///usr/local/share/doc/vllm-swift-healthcheck/README.md
+
+[Timer]
+# A first check shortly after boot, so an autostart that failed to come up is
+# reported instead of sitting unnoticed.
+OnBootSec=5min
+# Then steady-state polling.
+OnUnitActiveSec=2min
+AccuracySec=15s
+# Do not rewrite the trigger while a probe is still running.
+Unit=vllm-swift-healthcheck.service
+
+[Install]
+WantedBy=timers.target

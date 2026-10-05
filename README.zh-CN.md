@@ -117,7 +117,8 @@ NON_INTERACTIVE=1 ./launcher.sh
 
 使用 `./launcher.sh --print-config` 预览路线。自动化部署见
 [非交互启动说明](docs/non-interactive-launch.zh-CN.md)；CPU 中转层加磁盘缓存（含
-FIFO 淘汰）见 [KV 缓存卸载与分层说明](docs/kv-offload-tiering.zh-CN.md)。
+FIFO 淘汰）见 [KV 缓存卸载与分层说明](docs/kv-offload-tiering.zh-CN.md)。要把路线作为受管服务运行（开机自启 + 健康看门狗），见
+[systemd 部署包](deploy/README.zh-CN.md)。
 
 ## 🧭 Profile 与推荐路线
 

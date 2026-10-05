@@ -1,0 +1,51 @@
+[Unit]
+Description=vLLM @SERVED_NAME@ (served by @LAUNCH_SCRIPT@ on port @PORT@)
+Documentation=file://@MANAGER_DIR@/README.md
+# Deliberately independent from any other service (for example a web UI that
+# happens to have launched the model interactively): this unit owns its own
+# cgroup, so restarting something else can no longer SIGKILL the model server.
+After=network-online.target
+Wants=network-online.target
+# The KV-offload cache volume must be mounted before the engine starts,
+# otherwise vLLM spills its KV cache onto the root filesystem.
+RequiresMountsFor=@CACHE_MNT@
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=forking
+# The launcher daemonizes the API server and writes its PID here. The name
+# embeds the served model name, so re-run deploy/install.sh after switching the
+# saved route in run-logs/start-manager.state.
+PIDFile=@MANAGER_DIR@/run-logs/vllm-@SERVED_NAME@.pid
+User=@RUN_USER@
+Group=@RUN_GROUP@
+WorkingDirectory=@MANAGER_DIR@
+Environment=HOME=@HOME_DIR@
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Operator-owned launch path: restores run-logs/start-manager.state, exports the
+# route's environment (for example VLLM_QWOPUS_MTP_BF16_DRAFT=1, without which
+# the compressed-tensors W4A16 MTP draft's fc layer is misread as INT4) and
+# KV_TRANSFER_CONFIG for the CPU staging + SSD cache tiers, and clears stale
+# /dev/shm/vllm_offload_*.mmap left behind by an unclean shutdown.
+ExecStart=@LAUNCH_SCRIPT@
+
+# Model load + health check + smoke test takes minutes; cold compile longer.
+TimeoutStartSec=1800
+TimeoutStopSec=180
+Restart=on-failure
+RestartSec=30
+
+# Model loading is memory hungry; never let systemd's defaults cap it.
+LimitNOFILE=524288
+LimitMEMLOCK=infinity
+
+# SIGTERM the whole cgroup so API server + engine + TP workers all exit, then
+# SIGKILL anything that lingers.
+KillMode=control-group
+KillSignal=SIGTERM
+SendSIGKILL=yes
+
+[Install]
+WantedBy=multi-user.target
