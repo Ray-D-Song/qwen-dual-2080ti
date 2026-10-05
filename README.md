@@ -125,7 +125,9 @@ NON_INTERACTIVE=1 ./launcher.sh
 ```
 
 Use `./launcher.sh --print-config` to preview a route. See the
-[non-interactive launch guide](docs/non-interactive-launch.md) for automation.
+[non-interactive launch guide](docs/non-interactive-launch.md) for automation,
+and the [KV cache offload and tiering guide](docs/kv-offload-tiering.md) for
+CPU staging plus disk-backed caching with FIFO eviction.
 
 ## 🧭 Profiles
 
