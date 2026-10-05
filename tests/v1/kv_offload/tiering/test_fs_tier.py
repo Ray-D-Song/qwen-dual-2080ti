@@ -969,3 +969,318 @@ def test_fs_tier_cross_tp_round_trip(tmp_path):
         assert torch.allclose(reader_tensor[1], expected)
     finally:
         reader.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# FIFO capacity management
+# ---------------------------------------------------------------------------
+
+# One stored block file is _BLOCK_ELEMENTS float32 values = 2 MiB.
+_BLOCK_BYTES = _BLOCK_ELEMENTS * 4
+
+
+def make_evicting_tier(tmp_path, **kwargs):
+    """Build a tier with FIFO eviction configured.
+
+    The background evictor is parked far in the future by default so tests can
+    drive eviction deterministically through tier.evict_now().
+    """
+    kwargs.setdefault("evict_interval_seconds", 3600.0)
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = FileSystemTierManager(
+        offloading_spec=_MOCK_OFFLOADING_SPEC,
+        primary_kv_view=memoryview(tensor.numpy()),
+        tier_type="fs",
+        root_dir=str(tmp_path),
+        n_read_threads=4,
+        n_write_threads=4,
+        **kwargs,
+    )
+    return tier, tensor
+
+
+def store_keys(tier, key_ids, job_id=1):
+    """Store one block per id and wait for the job to land."""
+    keys = [key(i) for i in key_ids]
+    tier.submit_store(make_job(job_id, keys, list(key_ids)))
+    results = drain(tier)
+    assert len(results) == 1 and results[0].success
+    return keys
+
+
+def block_path(tier, key_id) -> str:
+    return tier.file_mapper.get_file_name(key(key_id))
+
+
+def age_blocks(tier, key_ids, base: float | None = None) -> None:
+    """Give each block a distinct, increasing mtime.
+
+    mtime is the FIFO ordering key, so pinning it explicitly keeps the
+    assertions independent of filesystem timestamp granularity.
+    """
+    if base is None:
+        base = time.time() - 3600.0
+    for offset, key_id in enumerate(key_ids):
+        stamp = base + offset
+        os.utime(block_path(tier, key_id), (stamp, stamp))
+
+
+def test_no_limit_means_no_eviction(tmp_path):
+    """Without max_bytes/min_free_bytes the tier must never delete blocks."""
+    tier, _ = make_evicting_tier(tmp_path)
+    try:
+        store_keys(tier, [0, 1, 2])
+        age_blocks(tier, [0, 1, 2])
+
+        stats = tier.evict_now()
+        assert stats.evicted_blocks == 0
+        assert stats.remaining_bytes == 3 * _BLOCK_BYTES
+        assert all(os.path.exists(block_path(tier, i)) for i in range(3))
+    finally:
+        tier.shutdown()
+
+
+def test_fifo_evicts_oldest_written_first(tmp_path):
+    """The byte budget is enforced by deleting the oldest blocks first."""
+    tier, _ = make_evicting_tier(tmp_path, max_bytes=2 * _BLOCK_BYTES)
+    try:
+        store_keys(tier, [0, 1, 2, 3, 4])
+        age_blocks(tier, [0, 1, 2, 3, 4])
+
+        stats = tier.evict_now()
+        # 5 blocks (10 MiB) down to the 2-block (4 MiB) budget.
+        assert stats.evicted_blocks == 3
+        assert stats.remaining_bytes == 2 * _BLOCK_BYTES
+
+        assert not os.path.exists(block_path(tier, 0))
+        assert not os.path.exists(block_path(tier, 1))
+        assert not os.path.exists(block_path(tier, 2))
+        assert os.path.exists(block_path(tier, 3))
+        assert os.path.exists(block_path(tier, 4))
+    finally:
+        tier.shutdown()
+
+
+def test_eviction_keeps_config_json(tmp_path):
+    """Only *.bin block files are evictable; tier metadata must survive."""
+    tier, _ = make_evicting_tier(tmp_path, max_bytes=_BLOCK_BYTES)
+    try:
+        store_keys(tier, [0, 1, 2])
+        age_blocks(tier, [0, 1, 2])
+
+        config_path = tier.file_mapper.get_config_file_path()
+        assert os.path.exists(config_path)
+
+        stats = tier.evict_now()
+        assert stats.evicted_blocks == 2
+        assert os.path.exists(config_path)
+    finally:
+        tier.shutdown()
+
+
+def test_eviction_is_scoped_to_this_tier(tmp_path):
+    """A sibling model's cache must not be counted against this budget."""
+    tier, _ = make_evicting_tier(tmp_path, max_bytes=_BLOCK_BYTES)
+    try:
+        foreign_dir = tmp_path / "other-model_deadbeef_r0" / "aaa"
+        foreign_dir.mkdir(parents=True)
+        foreign = foreign_dir / "foreign.bin"
+        foreign.write_bytes(b"x" * (4 * _BLOCK_BYTES))
+        os.utime(foreign, (time.time() - 7200, time.time() - 7200))
+
+        store_keys(tier, [0, 1, 2])
+        age_blocks(tier, [0, 1, 2])
+
+        stats = tier.evict_now()
+        # The foreign block is older and larger, yet out of scope entirely.
+        assert foreign.exists()
+        assert stats.scanned_blocks == 3
+        assert stats.scanned_bytes == 3 * _BLOCK_BYTES
+    finally:
+        tier.shutdown()
+
+
+def test_eviction_preserves_surviving_block_data(tmp_path):
+    """Evicting some blocks must not corrupt the blocks that remain."""
+    tier, tensor = make_evicting_tier(tmp_path, max_bytes=2 * _BLOCK_BYTES)
+    try:
+        tensor[:] = _page_aligned_rand_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+        expected = {i: tensor[i].clone() for i in range(4)}
+
+        store_keys(tier, [0, 1, 2, 3])
+        age_blocks(tier, [0, 1, 2, 3])
+        assert tier.evict_now().evicted_blocks == 2
+        assert not os.path.exists(block_path(tier, 0))
+        assert not os.path.exists(block_path(tier, 1))
+
+        # Prove the survivors are read back from disk.
+        tensor[:] = 0.0
+        survivors = [2, 3]
+        tier.submit_load(
+            make_job(
+                2, [key(i) for i in survivors], survivors, is_promotion=True
+            )
+        )
+        results = drain(tier)
+        assert len(results) == 1 and results[0].success
+        for i in survivors:
+            assert torch.allclose(tensor[i], expected[i]), (
+                f"Block {i} corrupted by eviction"
+            )
+    finally:
+        tier.shutdown()
+
+
+def test_min_file_age_protects_fresh_blocks(tmp_path):
+    """A just-written block must not be evicted while it may be in flight."""
+    tier, _ = make_evicting_tier(
+        tmp_path, max_bytes=_BLOCK_BYTES, min_file_age_seconds=3600.0
+    )
+    try:
+        store_keys(tier, [0, 1, 2])
+        # mtimes are "now", i.e. younger than min_file_age_seconds.
+
+        stats = tier.evict_now()
+        assert stats.evicted_blocks == 0
+        assert stats.remaining_bytes == 3 * _BLOCK_BYTES
+    finally:
+        tier.shutdown()
+
+
+def test_min_free_bytes_triggers_eviction(tmp_path, monkeypatch):
+    """The free-space floor can drive eviction with no byte budget set."""
+    import vllm.v1.kv_offload.tiering.fs.eviction as eviction_mod
+
+    tier, _ = make_evicting_tier(tmp_path, min_free_bytes=1024)
+    try:
+        store_keys(tier, [0, 1, 2])
+        age_blocks(tier, [0, 1, 2])
+
+        class _FullStat:
+            f_bavail = 0
+            f_frsize = 1
+
+        monkeypatch.setattr(eviction_mod.os, "statvfs", lambda _p: _FullStat())
+
+        stats = tier.evict_now()
+        assert stats.evicted_blocks >= 1
+        assert stats.remaining_bytes < stats.scanned_bytes
+    finally:
+        tier.shutdown()
+
+
+def test_eviction_tolerates_block_vanishing_mid_pass(tmp_path, monkeypatch):
+    """A block deleted behind the evictor's back must not abort the pass."""
+    import vllm.v1.kv_offload.tiering.fs.eviction as eviction_mod
+
+    tier, _ = make_evicting_tier(tmp_path, max_bytes=_BLOCK_BYTES)
+    try:
+        store_keys(tier, [0, 1, 2])
+        age_blocks(tier, [0, 1, 2])
+
+        real_remove = os.remove
+        seen = {"n": 0}
+
+        def flaky_remove(path):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                raise FileNotFoundError(path)
+            return real_remove(path)
+
+        monkeypatch.setattr(eviction_mod.os, "remove", flaky_remove)
+
+        stats = tier.evict_now()
+        # The vanished file is still accounted for and the pass completes.
+        assert stats.evicted_blocks == 2
+        assert stats.remaining_bytes == _BLOCK_BYTES
+    finally:
+        tier.shutdown()
+
+
+def test_background_evictor_reclaims_space_without_manual_call(tmp_path):
+    """The evictor must act on its own after stores, not only when poked."""
+    tier, _ = make_evicting_tier(
+        tmp_path, max_bytes=2 * _BLOCK_BYTES, evict_interval_seconds=0.05
+    )
+    try:
+        store_keys(tier, [0, 1, 2, 3, 4])
+        age_blocks(tier, [0, 1, 2, 3, 4])
+        # Stores already notified; re-notify since mtimes were set afterwards.
+        tier._evictor.notify_stored()
+
+        deadline = time.monotonic() + 10.0
+        remaining = 5
+        while time.monotonic() < deadline:
+            remaining = sum(
+                1 for i in range(5) if os.path.exists(block_path(tier, i))
+            )
+            if remaining <= 2:
+                break
+            time.sleep(0.05)
+        assert remaining <= 2
+    finally:
+        tier.shutdown()
+
+
+def test_shutdown_stops_background_evictor(tmp_path):
+    """shutdown() must join the evictor thread so the tier leaks nothing."""
+    tier, _ = make_evicting_tier(
+        tmp_path, max_bytes=_BLOCK_BYTES, evict_interval_seconds=0.05
+    )
+    thread = tier._evictor._thread
+    assert thread is not None and thread.is_alive()
+    tier.shutdown()
+    assert not thread.is_alive()
+
+
+def test_invalid_eviction_policy_rejected(tmp_path):
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    with pytest.raises(ValueError, match="eviction policy"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            eviction_policy="lru",
+        )
+
+
+def test_non_positive_limit_rejected(tmp_path):
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    with pytest.raises(ValueError, match="max_bytes"):
+        FileSystemTierManager(
+            offloading_spec=_MOCK_OFFLOADING_SPEC,
+            primary_kv_view=memoryview(tensor.numpy()),
+            tier_type="fs",
+            root_dir=str(tmp_path),
+            max_bytes=0,
+        )
+
+
+def test_factory_forwards_eviction_config_to_fs_tier(tmp_path):
+    """The documented secondary_tiers keys must reach the constructor."""
+    tensor = _page_aligned_zero_tensor(_NUM_BLOCKS, _BLOCK_ELEMENTS)
+    tier = SecondaryTierFactory.create_secondary_tier(
+        {
+            "type": "fs",
+            "root_dir": str(tmp_path),
+            "n_read_threads": 2,
+            "n_write_threads": 2,
+            "eviction_policy": "fifo",
+            "max_bytes": 4 * _BLOCK_BYTES,
+            "min_free_bytes": 8192,
+            "min_file_age_seconds": 3,
+            "evict_interval_seconds": 3600.0,
+        },
+        memoryview(tensor.numpy()),
+        _MOCK_OFFLOADING_SPEC,
+    )
+    try:
+        assert isinstance(tier, FileSystemTierManager)
+        assert tier._evictor.enabled
+        assert tier._evictor.max_bytes == 4 * _BLOCK_BYTES
+        assert tier._evictor.min_free_bytes == 8192
+        assert tier._evictor.min_file_age_seconds == 3
+        assert tier._evictor.name_prefix.startswith("test-model_")
+    finally:
+        tier.shutdown()

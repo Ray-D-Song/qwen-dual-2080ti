@@ -26,6 +26,23 @@ Configuration via kv_connector_extra_config:
         via SecondaryTierFactory.register_tier()
       - Additional tier-specific parameters are passed directly to the tier
         constructor. See each tier's documentation for supported parameters.
+        For the "fs" tier these include, in addition to root_dir and the
+        thread counts:
+          - max_bytes: (optional) byte budget for this tier's cache
+            directory. When exceeded, the oldest-written blocks are evicted
+            first (FIFO). Omit to keep blocks forever.
+          - min_free_bytes: (optional) floor on the holding filesystem's free
+            space; eviction also runs below it (ENOSPC safety net).
+          - eviction_policy: (optional) only "fifo" is supported.
+          - min_file_age_seconds: (optional) blocks younger than this are
+            never evicted (default 10).
+          - evict_interval_seconds: (optional) background evictor wake-up
+            period (default 5).
+
+Note on cpu_bytes_to_use: the CPU primary tier is the gateway for all
+GPU<->offload transfers; secondary tiers cannot reach GPU memory directly, so
+this tier cannot be removed. It can be made small, but it must hold at least
+one chunk.
 
 Example configuration:
 {
@@ -290,6 +307,17 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
             if int(self.extra_config.get("store_threshold", 0)) >= 2:
                 raise ValueError(
                     "store_threshold is not supported for TieringOffloadingSpec"
+                )
+
+            # A zero-chunk primary tier cannot be mmap'd; without this guard
+            # the failure surfaces later as an opaque mmap error. Tiering
+            # always allocates a shared region, so num_chunks must be >= 1.
+            if self.num_chunks < 1:
+                raise ValueError(
+                    "cpu_bytes_to_use is too small for TieringOffloadingSpec: "
+                    f"it yields 0 chunks (one offloaded chunk is "
+                    f"{self.kv_bytes_per_chunk} bytes). Increase "
+                    "cpu_bytes_to_use to at least one chunk."
                 )
 
             scheduler_mmap: SharedOffloadRegion | None = None

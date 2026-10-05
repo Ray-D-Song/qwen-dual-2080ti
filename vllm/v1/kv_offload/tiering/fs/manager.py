@@ -13,6 +13,12 @@ Load path:
 
 File naming:  <base_path>_r<rank>/<hhh>/<hh>_g<group_idx>/<hash_hex>.bin
               (hash-based subdirectories to limit directory fan-out)
+
+Capacity:
+    The tier stores blocks forever unless a byte budget is configured. Set
+    ``max_bytes`` (budget for this tier's own cache directory) and/or
+    ``min_free_bytes`` (floor on the filesystem's free space) to enable FIFO
+    eviction, which removes the oldest-written blocks first. See eviction.py.
 """
 
 import functools
@@ -48,6 +54,10 @@ from vllm.v1.kv_offload.tiering.base import (
     ScheduleEndContext,
     SecondaryTierManager,
     TransferJob,
+)
+from vllm.v1.kv_offload.tiering.fs.eviction import (
+    EvictionStats,
+    FifoCacheEvictor,
 )
 from vllm.v1.kv_offload.tiering.fs.io import (
     batch_load_block,
@@ -117,6 +127,11 @@ class FileSystemTierManager(SecondaryTierManager):
         n_write_threads: int = 16,
         enable_kv_events: bool = False,
         locality: str | None = None,
+        max_bytes: int | None = None,
+        min_free_bytes: int | None = None,
+        eviction_policy: str = "fifo",
+        min_file_age_seconds: float = 10.0,
+        evict_interval_seconds: float = 5.0,
     ):
         """
         Args:
@@ -132,6 +147,20 @@ class FileSystemTierManager(SecondaryTierManager):
                 cache events are enabled globally (kv_events_config).
             locality: Whether this tier's storage is LOCAL or REMOTE relative
                 to the publishing vLLM instance.
+            max_bytes: Optional byte budget for this tier's own cache
+                directory. When exceeded, the oldest-written blocks are
+                evicted first (FIFO). ``None`` disables capacity management,
+                preserving the historical never-delete behaviour.
+            min_free_bytes: Optional floor on the free space of the
+                filesystem holding the cache, checked via statvfs. Eviction
+                also runs when free space drops below it. This is a safety net
+                against ENOSPC for space this tier does not account for.
+            eviction_policy: Eviction policy name. Only "fifo" is supported.
+            min_file_age_seconds: Blocks younger than this are never evicted,
+                so a block that is being promoted right now is not removed
+                from under its reader.
+            evict_interval_seconds: How often the background evictor wakes to
+                check whether it needs to scan.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         self.locality = Locality(locality) if locality is not None else None
@@ -203,6 +232,42 @@ class FileSystemTierManager(SecondaryTierManager):
 
         self._lookup_manager = FsAsyncLookupManager(tier=self, tier_type=self.tier_type)
 
+        # FIFO capacity management. Opt-in: with no limit configured the
+        # evictor is inert and the tier behaves exactly as before.
+        #
+        # Blocks land in "<base_path>_r<rank>/...", so the tier's own cache is
+        # a set of siblings of base_path, not base_path itself. Scan the
+        # configured root (which also gives the right filesystem for the
+        # free-space check) and confine the byte budget with the name prefix.
+        base_path = self.file_mapper.base_path
+        self._evictor = FifoCacheEvictor(
+            os.path.dirname(base_path),
+            name_prefix=os.path.basename(base_path) + "_r",
+            max_bytes=max_bytes,
+            min_free_bytes=min_free_bytes,
+            eviction_policy=eviction_policy,
+            min_file_age_seconds=min_file_age_seconds,
+            interval_seconds=evict_interval_seconds,
+        )
+        if self._evictor.enabled:
+            if max_bytes is not None and max_bytes < self._block_size:
+                logger.warning(
+                    "max_bytes=%d for the '%s' KV offload tier is smaller than "
+                    "one block (%d bytes); the tier will evict continuously.",
+                    max_bytes,
+                    tier_type,
+                    self._block_size,
+                )
+            logger.info(
+                "FIFO eviction enabled for the '%s' KV offload tier at %s "
+                "(max_bytes=%s, min_free_bytes=%s)",
+                tier_type,
+                self.file_mapper.base_path,
+                max_bytes,
+                min_free_bytes,
+            )
+            self._evictor.start()
+
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         return RequestOffloadingContext()
@@ -228,6 +293,10 @@ class FileSystemTierManager(SecondaryTierManager):
             self._use_o_direct,
         )
         self._pool.enqueue_store(job_metadata.job_id, 1, [task])
+        # Wake the FIFO evictor. Notifying optimistically (rather than after
+        # the job lands) is safe: each pass rescans the directory, so the
+        # evictor's view is always the on-disk truth.
+        self._evictor.notify_stored()
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
@@ -327,6 +396,14 @@ class FileSystemTierManager(SecondaryTierManager):
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._lookup_manager.cleanup(req_context.req_id)
 
+    def evict_now(self) -> EvictionStats:
+        """Run one FIFO eviction pass now, synchronously.
+
+        Exposed for operators and tests; the background thread calls this on
+        its own schedule during normal operation.
+        """
+        return self._evictor.evict_now()
+
     @override
     def on_schedule_end(self, context: ScheduleEndContext) -> None:
         self._lookup_manager.flush()
@@ -339,5 +416,9 @@ class FileSystemTierManager(SecondaryTierManager):
         Shuts down the lookup manager and the thread pool,
         clearing pending tasks and waiting for active threads to complete.
         """
+        # Stop the evictor first so it is not mid-scan while the tier tears
+        # down (it only touches the filesystem, but this keeps teardown
+        # deterministic and leak-free).
+        self._evictor.close()
         self._lookup_manager.shutdown()
         self._pool.shutdown(wait=True)

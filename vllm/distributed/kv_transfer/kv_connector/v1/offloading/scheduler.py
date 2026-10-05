@@ -543,6 +543,10 @@ class OffloadingConnectorScheduler:
         )
         self.manager: OffloadingManager = spec.get_manager()
         self._connector_stats = OffloadingConnectorStats()
+        # Throttle for the allocation-failure warning below: this fires on a
+        # per-block hot path, so a persistently undersized primary tier must
+        # not flood the log.
+        self._last_allocation_failure_warning = 0.0
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -615,6 +619,29 @@ class OffloadingConnectorScheduler:
             _ConnectorMetricName.LOOKUP_ASYNC_DELAY,
             time.monotonic() - start_time,
         )
+
+    def _note_allocation_failure(self, req_id: str) -> None:
+        """Record that prepare_store() could not allocate, and maybe say so.
+
+        The primary tier refuses a store when it cannot free enough chunks
+        (e.g. too small a cpu_bytes_to_use, or every chunk pinned by in-flight
+        transfers). The affected block is silently skipped, so without this
+        signal a mis-sized primary tier looks like a mysterious drop in cache
+        hit rate. The counter is always incremented; the warning is throttled
+        because this runs once per block.
+        """
+        self._connector_stats.increase_counter(
+            _ConnectorMetricName.ALLOCATION_FAILURE
+        )
+        now = time.monotonic()
+        if now - self._last_allocation_failure_warning >= 60.0:
+            self._last_allocation_failure_warning = now
+            logger.warning(
+                "KV offload: primary tier could not allocate space; dropping "
+                "this store (request %s). Repeated occurrences mean "
+                "cpu_bytes_to_use is too small for the workload.",
+                req_id,
+            )
 
     def _generate_job_id(self) -> int:
         job_id = self._job_counter
@@ -1279,9 +1306,7 @@ class OffloadingConnectorScheduler:
                 key = self._make_boundary_key(req, group_idx, boundary)
                 store_output = self.manager.prepare_store([key], req_status.req_context)
                 if store_output is None:
-                    self._connector_stats.increase_counter(
-                        _ConnectorMetricName.ALLOCATION_FAILURE
-                    )
+                    self._note_allocation_failure(req_id)
                     continue
                 if not store_output.keys_to_store:
                     continue
@@ -1384,9 +1409,7 @@ class OffloadingConnectorScheduler:
 
             store_output = self.manager.prepare_store(keys, req_status.req_context)
             if store_output is None:
-                self._connector_stats.increase_counter(
-                    _ConnectorMetricName.ALLOCATION_FAILURE
-                )
+                self._note_allocation_failure(req_id)
                 continue
             if not store_output.keys_to_store:
                 continue
@@ -1635,10 +1658,7 @@ class OffloadingConnectorScheduler:
                 new_offload_keys, req_status.req_context
             )
             if store_output is None:
-                self._connector_stats.increase_counter(
-                    _ConnectorMetricName.ALLOCATION_FAILURE
-                )
-                logger.warning("Request %s: cannot store chunks", req_id)
+                self._note_allocation_failure(req_id)
                 continue
 
             if not store_output.keys_to_store:
